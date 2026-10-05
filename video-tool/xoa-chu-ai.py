@@ -1,6 +1,9 @@
 import cv2, numpy as np, onnxruntime as ort, subprocess, sys, json, time
 inp, out, box, t0, t1 = sys.argv[1], sys.argv[2], json.loads(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
-only = [int(x) for x in sys.argv[6].split(',')] if len(sys.argv) > 6 else None
+# optional 6th arg: comma-separated frame numbers to preview, or "box" to mask the whole box (for animated captions)
+arg6 = sys.argv[6] if len(sys.argv) > 6 else ''
+whole_box = arg6 == 'box'
+only = [int(x) for x in arg6.split(',')] if arg6 and not whole_box else None
 so = ort.SessionOptions(); so.intra_op_num_threads = 4
 sess = ort.InferenceSession('lama/lama_fp32.onnx', so)
 cap = cv2.VideoCapture(inp); fps = cap.get(cv2.CAP_PROP_FPS); frames = []
@@ -12,6 +15,8 @@ n = len(frames); H, W = frames[0].shape[:2]
 bx, by, bw, bh = box; X0, Y0 = int(bx * W), int(by * H); X1, Y1 = int((bx + bw) * W), int((by + bh) * H)
 K = np.ones((3, 3), np.uint8)
 def text_mask(k):
+    if whole_box:
+        full = np.zeros((H, W), np.uint8); full[Y0:Y1, X0:X1] = 255; return full
     f = frames[k][Y0:Y1, X0:X1].astype(np.int16); st = np.zeros(f.shape[:2], bool)
     for d in (-15, -8, 8, 15):
         j = k + d

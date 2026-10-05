@@ -306,6 +306,8 @@ async function analyze(src) {
   const step = src.dur > 180 ? 1 : src.dur > 60 ? 0.75 : 0.5;
   const aw = 36, ah = 64, a = document.createElement('canvas'); a.width = aw; a.height = ah; const ax = a.getContext('2d', { willReadFrequently: true });
   const tc = document.createElement('canvas'); tc.width = 90; tc.height = 160; const tx = tc.getContext('2d');
+  const dw = 144, dh = 256, dc = document.createElement('canvas'); dc.width = dw; dc.height = dh; const dx = dc.getContext('2d', { willReadFrequently: true });
+  const grays = [], times = [];
   src.samples = []; let prev = null;
   const n = Math.max(1, Math.floor(src.dur / step));
   for (let k = 0; k < n; k++) {
@@ -320,14 +322,150 @@ async function analyze(src) {
     // colour difference against the previous sample (catches cuts between shots of similar brightness)
     let diff = 0; if (prev) { for (let p = 0; p < d.length; p += 4) diff += Math.abs(d[p] - prev[p]) + Math.abs(d[p + 1] - prev[p + 1]) + Math.abs(d[p + 2] - prev[p + 2]); diff /= (d.length / 4) * 3 * 255; }
     prev = d;
+    dx.drawImage(v, 0, 0, dw, dh);
+    const dd = dx.getImageData(0, 0, dw, dh).data, g = new Float32Array(dw * dh);
+    for (let p = 0, q = 0; p < dd.length; p += 4, q++) g[q] = (0.299 * dd[p] + 0.587 * dd[p + 1] + 0.114 * dd[p + 2]) / 255;
+    grays.push(g); times.push(t);
     drawCoverSmall(tx, v, 90, 160);
     src.samples.push({ t, lum: sum / lum.length, sharp: sharp / (ah * (aw - 1)), diff, thumb: tc.toDataURL('image/jpeg', 0.72) });
     if (k === 0) src.thumb = src.samples[0].thumb;
     src.progress = (k + 1) / n; updateSrcProgress(src);
   }
   v.removeAttribute('src'); v.load(); v.remove();
-  src.clips = makeClips(src, step); src.status = 'ready';
+  src.clips = makeClips(src, step);
+  const boxes = detectText(grays, dw, dh, times, src.dur, step);
+  src.mask = { on: boxes.length > 0, mode: 'crop', boxes };
+  src.status = 'ready';
 }
+/* Burned-in captions stay put while the handheld camera moves, so we look for strong edges
+   that keep the same brightness between samples taken while the rest of the frame changes. */
+function detectText(G, w, h, times, dur, step) {
+  const n = G.length; if (n < 3) return [];
+  const edge = g => { const e = new Float32Array(w * h); for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) { const i = y * w + x; e[i] = Math.abs(g[i + 1] - g[i - 1]) + Math.abs(g[i + w] - g[i - w]); } return e; };
+  // a pixel counts as caption when it stays a sharp, unchanged edge for ~1.5 s in a row
+  const E = G.map(edge), F = new Array(n).fill(null), run = new Uint16Array(w * h), C = new Uint16Array(w * h);
+  const need = Math.max(2, Math.round(1.4 / step));
+  for (let k = 1; k < n; k++) {
+    const a = G[k], b = G[k - 1]; let mo = 0; for (let i = 0; i < a.length; i++) mo += Math.abs(a[i] - b[i]); mo /= a.length;
+    if (mo < 0.02) continue; // camera standing still: can't tell captions from scenery
+    const f = new Uint8Array(w * h);
+    for (let i = 0; i < f.length; i++) {
+      if (E[k][i] > 0.2 && E[k - 1][i] > 0.2 && Math.abs(a[i] - b[i]) < 0.045) { f[i] = 1; run[i]++; if (run[i] > C[i]) C[i] = run[i]; } else run[i] = 0;
+    }
+    F[k] = f;
+  }
+  const M = new Uint8Array(w * h);
+  for (let y = 1; y < h - 1; y++) for (let x = 2; x < w - 2; x++) {
+    const i = y * w + x; if (C[i] < need) continue; let c = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -2; dx <= 2; dx++) if (C[i + dy * w + dx] >= need) c++;
+    if (c >= 4) M[i] = 1;
+  }
+  const D = new Uint8Array(w * h), rx = 4, ry = 2; // join letters into lines
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (M[y * w + x]) for (let dy = -ry; dy <= ry; dy++) for (let dx = -rx; dx <= rx; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < h && xx >= 0 && xx < w) D[yy * w + xx] = 1; }
+  const lab = new Int32Array(w * h), out = []; let id = 0;
+  for (let s0 = 0; s0 < D.length; s0++) {
+    if (!D[s0] || lab[s0]) continue; id++; const st = [s0]; lab[s0] = id; let x0 = w, y0 = h, x1 = 0, y1 = 0, cnt = 0;
+    while (st.length) { const i = st.pop(), x = i % w, y = (i / w) | 0; if (M[i]) cnt++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (const j of [i - 1, i + 1, i - w, i + w]) if (j >= 0 && j < D.length && D[j] && !lab[j] && Math.abs((j % w) - x) <= 1) { lab[j] = id; st.push(j); } }
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    if (bw < 12 || bh < 4 || bh > h * 0.3 || cnt < 20 || cnt / (bw * bh) < 0.06) continue;
+    // when is it on screen?
+    let mx = 0; const fr = F.map(f => { if (!f) return -1; let c = 0; for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) c += f[y * w + x]; const v = c / (bw * bh); if (v > mx) mx = v; return v; });
+    let k0 = -1, k1 = -1; fr.forEach((v, k) => { if (v >= Math.max(0.01, mx * 0.25)) { if (k0 < 0) k0 = k; k1 = k; } });
+    if (k0 < 0) continue;
+    let t0 = Math.max(0, times[Math.max(0, k0 - 1)] - step * 0.6), t1 = Math.min(dur, times[k1] + step * 1.2);
+    if (t0 < step * 1.5) t0 = 0; if (dur - t1 < step * 2) t1 = dur;
+    const px = 0.015, py = 0.008;
+    out.push({ x: Math.max(0, x0 / w - px), y: Math.max(0, y0 / h - py), w: Math.min(1, bw / w + 2 * px), h: Math.min(1, bh / h + 2 * py), t0, t1 });
+  }
+  // merge boxes that overlap in space and time
+  for (let i = 0; i < out.length; i++) for (let j = i + 1; j < out.length; j++) {
+    const a = out[i], b = out[j];
+    const ov = a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h + 0.01 && b.y < a.y + a.h + 0.01 && a.t0 <= b.t1 + 0.5 && b.t0 <= a.t1 + 0.5;
+    if (ov) { const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y); out[i] = { x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y, t0: Math.min(a.t0, b.t0), t1: Math.max(a.t1, b.t1) }; out.splice(j, 1); j = i; }
+  }
+  return out.map(b => ({ ...b, id: uid('b') }));
+}
+
+const wk = document.createElement('canvas'), wkx = wk.getContext('2d', { willReadFrequently: true });
+const tiny = document.createElement('canvas'), tinyx = tiny.getContext('2d');
+function cropRect(boxes, vw, vh) {
+  let top = 1, bot = 0; boxes.forEach(b => { top = Math.min(top, b.y); bot = Math.max(bot, b.y + b.h); });
+  let sy, sh; if ((top + bot) / 2 < 0.5) { sy = bot * vh; sh = vh - sy; } else { sy = 0; sh = top * vh; }
+  if (sh < vh * 0.45) return { sx: 0, sy: 0, sw: vw, sh: vh };
+  return { sx: 0, sy, sw: vw, sh };
+}
+/* Returns the frame to draw with captions removed: {img, sx, sy, sw, sh}. */
+function cleanFrame(v, src) {
+  const vw = v.videoWidth, vh = v.videoHeight, m = src && src.mask, full = { img: v, sx: 0, sy: 0, sw: vw, sh: vh };
+  if (!m || !m.on || !m.boxes.length) return full;
+  if (m.mode === 'crop') return { img: v, ...cropRect(m.boxes, vw, vh) };
+  const t = v.currentTime, act = m.boxes.filter(b => t >= b.t0 && t <= b.t1);
+  if (!act.length) return full;
+  if (wk.width !== vw || wk.height !== vh) { wk.width = vw; wk.height = vh; }
+  wkx.drawImage(v, 0, 0, vw, vh);
+  for (const b of act) {
+    const x = Math.max(0, Math.round(b.x * vw)), y = Math.max(0, Math.round(b.y * vh));
+    const w = Math.min(vw - x, Math.round(b.w * vw)), h = Math.min(vh - y, Math.round(b.h * vh));
+    if (w < 2 || h < 2) continue;
+    if (m.mode === 'blur') blurRect(x, y, w, h); else inpaint(x, y, w, h, vw, vh);
+  }
+  return { img: wk, sx: 0, sy: 0, sw: vw, sh: vh };
+}
+const canFilter = typeof wkx.filter === 'string';
+function blurRect(x, y, w, h) {
+  if (canFilter) { const r = Math.max(8, Math.round(h / 5)); wkx.save(); wkx.beginPath(); wkx.rect(x, y, w, h); wkx.clip(); wkx.filter = `blur(${r}px)`; wkx.drawImage(wk, x - r * 2, y - r * 2, w + r * 4, h + r * 4, x - r * 2, y - r * 2, w + r * 4, h + r * 4); wkx.restore(); return; }
+  const tw = Math.max(2, Math.round(w / 16)), th = Math.max(2, Math.round(h / 16)); tiny.width = tw; tiny.height = th;
+  tinyx.imageSmoothingEnabled = true; tinyx.drawImage(wk, x, y, w, h, 0, 0, tw, th);
+  wkx.imageSmoothingEnabled = true; wkx.imageSmoothingQuality = 'high'; wkx.drawImage(tiny, 0, 0, tw, th, x, y, w, h);
+}
+/* Fill the box from its border colours (smooth base) and borrow fine texture from the mirrored strip next to it. */
+function inpaint(x0, y0, w, h, VW, VH) {
+  const hasL = x0 >= 2, hasR = x0 + w <= VW - 2, hasT = y0 >= 2, hasB = y0 + h <= VH - 2;
+  if (!hasL && !hasR && !hasT && !hasB) return;
+  const rx = Math.max(0, x0 - 2), ry = Math.max(0, y0 - 2), rw = Math.min(VW, x0 + w + 2) - rx, rh = Math.min(VH, y0 + h + 2) - ry;
+  const R = wkx.getImageData(rx, ry, rw, rh), d = R.data, ox = x0 - rx, oy = y0 - ry;
+  const px = (x, y, c) => d[((y) * rw + (x)) * 4 + c];
+  // texture strip (mirrored) from below if possible, else above
+  let tex = null, ty = -1;
+  if (y0 + 2 * h <= VH) ty = y0 + h; else if (y0 - h >= 0) ty = y0 - h;
+  if (ty >= 0) {
+    const T = wkx.getImageData(x0, ty, w, h).data, rad = 3, I = new Float64Array((w + 1) * (h + 1) * 3);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) for (let c = 0; c < 3; c++) {
+      const k = ((y + 1) * (w + 1) + (x + 1)) * 3 + c;
+      I[k] = T[(y * w + x) * 4 + c] + I[(y * (w + 1) + (x + 1)) * 3 + c] + I[((y + 1) * (w + 1) + x) * 3 + c] - I[(y * (w + 1) + x) * 3 + c];
+    }
+    tex = (x, y, c) => {
+      const xa = Math.max(0, x - rad), xb = Math.min(w, x + rad + 1), ya = Math.max(0, y - rad), yb = Math.min(h, y + rad + 1);
+      const s = I[(yb * (w + 1) + xb) * 3 + c] - I[(ya * (w + 1) + xb) * 3 + c] - I[(yb * (w + 1) + xa) * 3 + c] + I[(ya * (w + 1) + xa) * 3 + c];
+      return T[(y * w + x) * 4 + c] - s / ((xb - xa) * (yb - ya));
+    };
+  }
+  const L = [], Rr = [], Tp = [], Bt = [];
+  for (let j = 0; j < h; j++) for (let c = 0; c < 3; c++) {
+    if (hasL) L[j * 3 + c] = (px(ox - 1, oy + j, c) + px(ox - 2, oy + j, c)) / 2;
+    if (hasR) Rr[j * 3 + c] = (px(ox + w, oy + j, c) + px(ox + w + 1, oy + j, c)) / 2;
+  }
+  for (let i = 0; i < w; i++) for (let c = 0; c < 3; c++) {
+    if (hasT) Tp[i * 3 + c] = (px(ox + i, oy - 1, c) + px(ox + i, oy - 2, c)) / 2;
+    if (hasB) Bt[i * 3 + c] = (px(ox + i, oy + h, c) + px(ox + i, oy + h + 1, c)) / 2;
+  }
+  // soften the borders so single bright pixels don't smear into streaks
+  const smooth = (A, len, r) => { if (!A.length) return A; const o = []; for (let i = 0; i < len; i++) for (let c = 0; c < 3; c++) { let s = 0, n = 0; for (let k = Math.max(0, i - r); k <= Math.min(len - 1, i + r); k++) { s += A[k * 3 + c]; n++; } o[i * 3 + c] = s / n; } return o; };
+  const L2 = smooth(L, h, 4), R2 = smooth(Rr, h, 4), T2 = smooth(Tp, w, 4), B2 = smooth(Bt, w, 4);
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+    const wl = hasL ? 1 / (i + 1) : 0, wr = hasR ? 1 / (w - i) : 0, wt = hasT ? 1 / (j + 1) : 0, wb = hasB ? 1 / (h - j) : 0, sw = wl + wr + wt + wb;
+    const fe = Math.min(1, Math.min(hasL ? i + 1 : 99, hasR ? w - i : 99, hasT ? j + 1 : 99, hasB ? h - j : 99) / 6);
+    const k = ((oy + j) * rw + ox + i) * 4, mj = h - 1 - j;
+    for (let c = 0; c < 3; c++) {
+      let v = ((hasL ? L2[j * 3 + c] * wl : 0) + (hasR ? R2[j * 3 + c] * wr : 0) + (hasT ? T2[i * 3 + c] * wt : 0) + (hasB ? B2[i * 3 + c] * wb : 0)) / sw;
+      if (tex) v += 0.5 * fe * clamp(tex(i, mj, c), -28, 28);
+      d[k + c] = v;
+    }
+  }
+  wkx.putImageData(R, rx, ry);
+}
+
 function makeClips(src, step) {
   const sm = src.samples; if (!sm.length) return [];
   const diffs = sm.slice(1).map(s => s.diff);
@@ -413,13 +551,14 @@ function drawLines(L, x, y, s, fillC, strokeC, sw, lh = 1.18) {
 }
 function parseVND(s) { if (!s) return 0; s = s.toLowerCase().replace(/\s/g, ''); const m = s.match(/([\d.,]+)\s*(k|tr|triệu|m)?/); if (!m) return 0; let n = parseFloat(m[1].replace(/[.,](?=\d{3}\b)/g, '').replace(',', '.')); if (m[2] === 'k') n *= 1e3; else if (m[2]) n *= 1e6; return n || 0; }
 
-function drawVideo(v, scale) {
-  const vw = v.videoWidth, vh = v.videoHeight;
-  const cover = (sc) => { const s = Math.max(W / vw, H / vh) * sc; ctx.drawImage(v, (W - vw * s) / 2, (H - vh * s) / 2, vw * s, vh * s); };
+function drawVideo(fr, scale) {
+  const { img, sx, sy, sw: vw, sh: vh } = fr;
+  const put = s => ctx.drawImage(img, sx, sy, vw, vh, (W - vw * s) / 2, (H - vh * s) / 2, vw * s, vh * s);
+  const cover = (sc) => put(Math.max(W / vw, H / vh) * sc);
   if (S.opts.fit === 'blur' && vw / vh > 0.8) {
     ctx.save(); ctx.filter = 'blur(40px) brightness(0.55)'; cover(1.2); ctx.restore();
     ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(0, 0, W, H);
-    const s = Math.min(W / vw, H / vh) * scale; ctx.drawImage(v, (W - vw * s) / 2, (H - vh * s) / 2, vw * s, vh * s);
+    put(Math.min(W / vw, H / vh) * scale);
   } else cover(scale);
 }
 function drawPlaceholder(i, lt) {
@@ -492,7 +631,7 @@ function drawAt(t) {
   let scale = S.opts.kb ? 1 + 0.07 * (lt / sh.dur) : 1;
   if (fx === 'zoom' && i > 0 || sh.role === 'hook' && fx === 'zoom') scale *= 1 + 0.22 * Math.pow(Math.max(0, 1 - lt / 0.35), 2);
   const v = sh.srcId ? player.els.get(sh.id) : null;
-  if (v && v.readyState >= 2 && v.videoWidth) drawVideo(v, scale); else if (sh.srcId) { ctx.fillStyle = '#111'; ctx.fillRect(0, 0, W, H); } else drawPlaceholder(i, lt);
+  if (v && v.readyState >= 2 && v.videoWidth) drawVideo(cleanFrame(v, srcById(sh.srcId)), scale); else if (sh.srcId) { ctx.fillStyle = '#111'; ctx.fillRect(0, 0, W, H); } else drawPlaceholder(i, lt);
   drawOverlay(sh, lt);
   drawBrand();
   if (i > 0 || fx === 'fade') {
@@ -800,6 +939,6 @@ document.addEventListener('visibilitychange', () => { if (document.hidden && job
 
 renderFields(); renderTemplates(); renderSources(); renderLib(); applyTemplate(false);
 if (document.fonts) { document.fonts.load(`900 100px ${FONT}`).then(() => drawAt(player.t)).catch(() => {}); document.fonts.ready.then(() => drawAt(player.t)); }
-window.__xvqc = { S, player, renderVideo, get outBlob() { return outBlob; } };
+window.__xvqc = { S, player, renderVideo, seekPreview, drawAt, get outBlob() { return outBlob; } };
 })();
 </script>
